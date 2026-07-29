@@ -250,7 +250,9 @@ func (s *Server) handleRequest(ctx context.Context, w dns.ResponseWriter, req *d
 		// TODO: Handle other query types (SRV, TXT, etc.) as needed.
 	}
 
-	truncateResponse(resp, maxSize)
+	if resp.Len() > maxSize {
+		dnsutil.Truncate(resp)
+	}
 	metrics.DNSQuery.WithLabelValues("true", metrics.Ok).Inc() // NameError is not an error
 
 	s.reply(w, req, resp)
@@ -288,21 +290,6 @@ func responseMaxSize(w dns.ResponseWriter, req *dns.Msg) int {
 		return int(req.UDPSize)
 	}
 	return dns.MinMsgSize
-}
-
-// truncateResponse packs resp and drops answer records until the packed message fits maxSize.
-// Pack reuses resp.Data when its capacity is sufficient, so the buffer must not be reset between iterations.
-func truncateResponse(resp *dns.Msg, maxSize int) {
-	if maxSize < dns.MinMsgSize {
-		maxSize = dns.MinMsgSize
-	}
-	for {
-		if err := resp.Pack(); err != nil || len(resp.Data) <= maxSize || len(resp.Answer) == 0 {
-			return
-		}
-		resp.Truncated = true
-		resp.Answer = resp.Answer[:len(resp.Answer)-1]
-	}
 }
 
 // forwardRequest forwards a DNS query to system DNS servers

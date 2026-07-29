@@ -116,7 +116,7 @@ func TestHandleRequestInternalATruncatesUDPResponse(t *testing.T) {
 	require.NoError(t, rec.Msg.Unpack())
 	assert.True(t, rec.Msg.Truncated)
 	assert.LessOrEqual(t, len(rec.Msg.Data), dns.MinMsgSize)
-	assert.NotEmpty(t, rec.Msg.Answer)
+	assert.Empty(t, rec.Msg.Answer)
 }
 
 // TestHandleRequestPooledReadBuffers sends alternating small and large queries through a real UDP server

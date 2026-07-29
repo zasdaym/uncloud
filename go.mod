@@ -7,7 +7,7 @@ require (
 	charm.land/bubbletea/v2 v2.0.2
 	charm.land/huh/v2 v2.0.1
 	charm.land/lipgloss/v2 v2.0.1
-	codeberg.org/miekg/dns v0.6.81
+	codeberg.org/miekg/dns v0.6.85
 	github.com/BurntSushi/toml v1.5.0
 	github.com/Masterminds/semver v1.5.0
 	github.com/Masterminds/squirrel v1.5.4
