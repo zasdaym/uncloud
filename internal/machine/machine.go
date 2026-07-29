@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -36,8 +37,10 @@ import (
 	machinedocker "github.com/psviderski/uncloud/internal/machine/docker"
 	"github.com/psviderski/uncloud/internal/machine/metrics"
 	"github.com/psviderski/uncloud/internal/machine/network"
+	"github.com/psviderski/uncloud/internal/machine/osinfo"
 	"github.com/psviderski/uncloud/internal/machine/store"
 	"github.com/psviderski/uncloud/internal/secret"
+	"github.com/psviderski/uncloud/internal/version"
 	"github.com/psviderski/uncloud/pkg/api"
 	"github.com/psviderski/unregistry"
 	"github.com/siderolabs/grpc-proxy/proxy"
@@ -376,6 +379,18 @@ func (m *Machine) Run(ctx context.Context) error {
 	if err := docker.WaitDaemonReady(ctx, m.config.DockerClient); err != nil {
 		return fmt.Errorf("wait for Docker daemon: %w", err)
 	}
+	defer m.config.DockerClient.Close()
+
+	// Bind the local API listeners before starting the dependencies (e.g. corrosion) to not deal with the teardown
+	// on failure.
+	machineListener, err := listenUnixSocket(m.config.MachineSockPath)
+	if err != nil {
+		return fmt.Errorf("listen machine API unix socket %q: %w", m.config.MachineSockPath, err)
+	}
+	proxyListener, err := listenUnixSocket(m.config.UncloudSockPath)
+	if err != nil {
+		return fmt.Errorf("listen API proxy unix socket %q: %w", m.config.UncloudSockPath, err)
+	}
 
 	// Configure and start the corrosion service on the loopback if the machine is not initialised as a cluster
 	// member. This provides the store required for the machine to initialise a new cluster on it. Once the machine
@@ -391,7 +406,7 @@ func (m *Machine) Run(ctx context.Context) error {
 		}
 		slog.Info("Corrosion service started.")
 	} else {
-		// Migrate the on-disk Corrosion store to 2026.5.14 (v1.0.0 upstream) if a v0.x store.db is detected,
+		// Migrate the on-disk Corrosion store to 2026.x.x (v1.0.0 upstream) if a v0.x store.db is detected,
 		// before any Corrosion start attempt. The legacy systemd unit (if installed) is stopped here too
 		// so we own the data dir exclusively.
 		if err := corromigrate.MigrateIfNeeded(ctx, m.config.CorrosionDataDir, m.config.CorrosionUser); err != nil {
@@ -403,10 +418,6 @@ func (m *Machine) Run(ctx context.Context) error {
 	errGroup, ctx := errgroup.WithContext(ctx)
 
 	// Start the local machine API server.
-	machineListener, err := listenUnixSocket(m.config.MachineSockPath)
-	if err != nil {
-		return fmt.Errorf("listen machine API unix socket %q: %w", m.config.MachineSockPath, err)
-	}
 	errGroup.Go(func() error {
 		slog.Info("Starting local machine API server.", "path", m.config.MachineSockPath)
 		if err := m.localMachineServer.Serve(machineListener); err != nil {
@@ -416,10 +427,6 @@ func (m *Machine) Run(ctx context.Context) error {
 	})
 
 	// Start the local API proxy server.
-	proxyListener, err := listenUnixSocket(m.config.UncloudSockPath)
-	if err != nil {
-		return fmt.Errorf("listen API proxy unix socket %q: %w", m.config.UncloudSockPath, err)
-	}
 	errGroup.Go(func() error {
 		slog.Info("Starting local API proxy server.", "path", m.config.UncloudSockPath)
 		if err := m.localProxyServer.Serve(proxyListener); err != nil {
@@ -516,7 +523,7 @@ func (m *Machine) Run(ctx context.Context) error {
 
 			m.mu.Lock()
 			m.clusterCtrl, err = newClusterController(
-				m.state,
+				m,
 				m.store,
 				proxyServer,
 				m.config.CorrosionService,
@@ -549,8 +556,6 @@ func (m *Machine) Run(ctx context.Context) error {
 
 	// Shutdown goroutine.
 	errGroup.Go(func() error {
-		var err error
-
 		<-ctx.Done()
 		slog.Info("Stopping local machine API server.")
 		// TODO: implement timeout for graceful shutdown.
@@ -564,28 +569,31 @@ func (m *Machine) Run(ctx context.Context) error {
 		m.proxyDirector.Close()
 		slog.Info("Local API proxy server stopped.")
 
-		// Stop the corrosion container so this node stops gossiping its membership as "Up" while the
-		// gRPC API is gone. Use a fresh context because ctx is already cancelled here.
-		slog.Info("Stopping corrosion service.")
-		stopCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		if stopErr := m.config.CorrosionService.Stop(stopCtx); stopErr != nil {
-			slog.Error("Failed to stop corrosion service.", "err", stopErr)
-		}
-		cancel()
-
-		// Clean up the machine data and resources if the machine shutdown was initiated by a reset.
-		if m.resetting {
-			slog.Info("Cleaning up machine data and resources.")
-			if err = m.cleanup(); err != nil {
-				slog.Error("Failed to clean up machine data and resources.", "err", err)
-			}
-		}
-
-		m.config.DockerClient.Close()
-		return err
+		return nil
 	})
 
-	return errGroup.Wait()
+	err = errGroup.Wait()
+
+	// Stop the corrosion container only after the API servers, cluster controller, and all components depending on the
+	// store have stopped, so this machine keeps serving the store until then. Use a fresh context because ctx
+	// is already cancelled here.
+	slog.Info("Stopping corrosion service.")
+	stopCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	if stopErr := m.config.CorrosionService.Stop(stopCtx); stopErr != nil {
+		slog.Error("Failed to stop corrosion service.", "err", stopErr)
+	}
+	cancel()
+	slog.Info("Corrosion service stopped.")
+
+	// Clean up the machine data and resources if the machine shutdown was initiated by a reset.
+	if m.resetting {
+		slog.Info("Cleaning up machine data and resources.")
+		if cleanupErr := m.cleanup(); cleanupErr != nil {
+			slog.Error("Failed to clean up machine data and resources.", "err", cleanupErr)
+		}
+	}
+
+	return err
 }
 
 // listenUnixSocket creates a new Unix socket listener with the specified path. The socket file is created with 0660
@@ -766,9 +774,11 @@ func (m *Machine) InitCluster(ctx context.Context, req *pb.InitClusterRequest) (
 	}
 	slog.Info("Cluster state initialised.", "network", clusterNetwork.String())
 
+	// Default the machine name to the machine's hostname when not explicitly provided.
 	machineName := req.MachineName
 	if machineName == "" {
-		if machineName, err = cluster.NewRandomMachineName(); err != nil {
+		hostname, _ := os.Hostname()
+		if machineName, err = cluster.DefaultMachineName(hostname, nil); err != nil {
 			return nil, status.Errorf(codes.Internal, "generate machine name: %v", err)
 		}
 	}
@@ -836,7 +846,8 @@ func (m *Machine) InitCluster(ctx context.Context, req *pb.InitClusterRequest) (
 	if err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
-	// Update the machine state with the new cluster configuration.
+	// Update the machine state with the new cluster configuration. The machine owns its MachineInfo,
+	// so persist the data locally as the source of truth.
 	m.state.ID = addResp.Machine.Id
 	m.state.Name = addResp.Machine.Name
 	m.state.Network = &network.Config{
@@ -846,6 +857,10 @@ func (m *Machine) InitCluster(ctx context.Context, req *pb.InitClusterRequest) (
 		MTU:           wgMTU,
 		PrivateKey:    m.state.Network.PrivateKey,
 		PublicKey:     m.state.Network.PublicKey,
+		Endpoints:     endpointsToAddrPorts(addResp.Machine.Network.Endpoints),
+	}
+	if addResp.Machine.PublicIp != nil {
+		m.state.PublicIP, _ = addResp.Machine.PublicIp.ToAddr()
 	}
 	if err = m.state.Save(); err != nil {
 		return nil, status.Errorf(codes.Internal, "save machine state: %v", err)
@@ -887,6 +902,14 @@ func (m *Machine) JoinCluster(_ context.Context, req *pb.JoinClusterRequest) (*e
 	// Update the machine state with the provided cluster configuration.
 	subnet, _ := req.Machine.Network.Subnet.ToPrefix()
 	manageIP, _ := req.Machine.Network.ManagementIp.ToAddr()
+	var publicIP netip.Addr
+	if req.Machine.PublicIp != nil {
+		var err error
+		publicIP, err = req.Machine.PublicIp.ToAddr()
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "invalid public IP: %v", err)
+		}
+	}
 
 	// Resolve the WireGuard listen port from the request, falling back to the default.
 	wgPort := int(req.WireguardPort)
@@ -899,6 +922,8 @@ func (m *Machine) JoinCluster(_ context.Context, req *pb.JoinClusterRequest) (*e
 		wgMTU = network.DetectMTU()
 	}
 
+	// Update the machine state with the new cluster configuration. The machine owns its MachineInfo,
+	// so persist the data locally as the source of truth.
 	m.state.ID = req.Machine.Id
 	m.state.Name = req.Machine.Name
 	m.state.Network = &network.Config{
@@ -908,7 +933,9 @@ func (m *Machine) JoinCluster(_ context.Context, req *pb.JoinClusterRequest) (*e
 		MTU:           wgMTU,
 		PrivateKey:    m.state.Network.PrivateKey,
 		PublicKey:     m.state.Network.PublicKey,
+		Endpoints:     endpointsToAddrPorts(req.Machine.Network.Endpoints),
 	}
+	m.state.PublicIP = publicIP
 	m.state.MinStoreVersion = req.MinStoreVersion
 
 	// Build a peers config from other cluster machines.
@@ -953,6 +980,22 @@ func (m *Machine) JoinCluster(_ context.Context, req *pb.JoinClusterRequest) (*e
 	return &emptypb.Empty{}, nil
 }
 
+// endpointsToAddrPorts converts pb.IPPort endpoints to netip.AddrPort, skipping any that fail to parse.
+func endpointsToAddrPorts(endpoints []*pb.IPPort) []netip.AddrPort {
+	if len(endpoints) == 0 {
+		return nil
+	}
+	addrPorts := make([]netip.AddrPort, 0, len(endpoints))
+	for _, ep := range endpoints {
+		ap, err := ep.ToAddrPort()
+		if err != nil {
+			continue
+		}
+		addrPorts = append(addrPorts, ap)
+	}
+	return addrPorts
+}
+
 // Token returns the local machine's token that can be used for adding the machine to a cluster.
 func (m *Machine) Token(_ context.Context, _ *emptypb.Empty) (*pb.TokenResponse, error) {
 	if len(m.state.Network.PublicKey) == 0 {
@@ -982,17 +1025,57 @@ func (m *Machine) Token(_ context.Context, _ *emptypb.Empty) (*pb.TokenResponse,
 	return &pb.TokenResponse{Token: tokenStr}, nil
 }
 
-// Deprecated: use InspectMachine instead.
-func (m *Machine) Inspect(_ context.Context, _ *emptypb.Empty) (*pb.MachineInfo, error) {
-	return &pb.MachineInfo{
+// Info returns the machine configuration and runtime details.
+func (m *Machine) Info(ctx context.Context) *pb.MachineInfo {
+	// Best-effort fetch of the Docker engine version. It stays empty if the engine is unavailable.
+	var dockerVersion string
+	if m.dockerService != nil {
+		v, err := m.dockerService.Client.ServerVersion(ctx)
+		if err != nil {
+			slog.Debug("Failed to get Docker engine version.", "err", err)
+		} else {
+			dockerVersion = v.Version
+		}
+	}
+
+	hostname, _ := os.Hostname()
+	osName := osinfo.PrettyName()
+	kernelVersion := osinfo.KernelVersion()
+
+	m.state.mu.RLock()
+	defer m.state.mu.RUnlock()
+
+	endpoints := make([]*pb.IPPort, len(m.state.Network.Endpoints))
+	for i, ep := range m.state.Network.Endpoints {
+		endpoints[i] = pb.NewIPPort(ep)
+	}
+
+	info := &pb.MachineInfo{
 		Id:   m.state.ID,
 		Name: m.state.Name,
 		Network: &pb.NetworkConfig{
 			Subnet:       pb.NewIPPrefix(m.state.Network.Subnet),
 			ManagementIp: pb.NewIP(m.state.Network.ManagementIP),
+			Endpoints:    endpoints,
 			PublicKey:    m.state.Network.PublicKey,
 		},
-	}, nil
+		DaemonVersion: version.String(),
+		DockerVersion: dockerVersion,
+		Hostname:      hostname,
+		Arch:          runtime.GOARCH,
+		OsPrettyName:  osName,
+		KernelVersion: kernelVersion,
+	}
+	if m.state.PublicIP.IsValid() {
+		info.PublicIp = pb.NewIP(m.state.PublicIP)
+	}
+
+	return info
+}
+
+// Deprecated: use InspectMachine instead.
+func (m *Machine) Inspect(ctx context.Context, _ *emptypb.Empty) (*pb.MachineInfo, error) {
+	return m.Info(ctx), nil
 }
 
 func (m *Machine) InspectMachine(ctx context.Context, _ *emptypb.Empty) (*pb.InspectMachineResponse, error) {
@@ -1013,20 +1096,91 @@ func (m *Machine) InspectMachine(ctx context.Context, _ *emptypb.Empty) (*pb.Ins
 		Machines: []*pb.MachineDetails{
 			{
 				// Metadata is injected by the gRPC proxy.
-				Machine: &pb.MachineInfo{
-					Id:   m.state.ID,
-					Name: m.state.Name,
-					Network: &pb.NetworkConfig{
-						Subnet:       pb.NewIPPrefix(m.state.Network.Subnet),
-						ManagementIp: pb.NewIP(m.state.Network.ManagementIP),
-						PublicKey:    m.state.Network.PublicKey,
-					},
-				},
+				Machine:      m.Info(ctx),
 				StoreVersion: storeVersion,
 				Rtts:         rtts,
 			},
 		},
 	}, nil
+}
+
+// UpdateMachine updates the configuration of this machine in its local state (the source of truth) and syncs
+// the result to the cluster store.
+func (m *Machine) UpdateMachine(ctx context.Context, req *pb.UpdateMachineRequest) (*pb.UpdateMachineResponse, error) {
+	if !m.Initialised() {
+		return nil, status.Error(codes.FailedPrecondition, "machine is not configured as a cluster member")
+	}
+
+	if err := m.applyMachineUpdate(ctx, req); err != nil {
+		return nil, err
+	}
+
+	m.mu.RLock()
+	clusterCtrl := m.clusterCtrl
+	m.mu.RUnlock()
+	if clusterCtrl != nil {
+		clusterCtrl.RequestMachineSync()
+	}
+
+	info := m.Info(ctx)
+	slog.Info("Machine configuration updated.", "id", info.Id, "name", info.Name)
+	return &pb.UpdateMachineResponse{Machine: info}, nil
+}
+
+// applyMachineUpdate validates the request and applies it to the local machine state under the write lock,
+// then persists the state to disk.
+func (m *Machine) applyMachineUpdate(ctx context.Context, req *pb.UpdateMachineRequest) error {
+	m.state.mu.Lock()
+	defer m.state.mu.Unlock()
+
+	if req.Name != nil {
+		if *req.Name == "" {
+			return status.Error(codes.InvalidArgument, "machine name cannot be empty")
+		}
+		// Check for duplicate names across the cluster, excluding this machine.
+		if *req.Name != m.state.Name {
+			machines, err := m.store.ListMachines(ctx)
+			if err != nil {
+				return status.Errorf(codes.Internal, "list machines: %v", err)
+			}
+			for _, other := range machines {
+				if other.Id != m.state.ID && other.Name == *req.Name {
+					return status.Errorf(codes.AlreadyExists, "machine with name '%s' already exists", *req.Name)
+				}
+			}
+		}
+		m.state.Name = *req.Name
+	}
+
+	if req.PublicIp != nil {
+		// An empty IP signals removal of the public IP.
+		if len(req.PublicIp.Ip) == 0 {
+			m.state.PublicIP = netip.Addr{}
+		} else {
+			ip, err := req.PublicIp.ToAddr()
+			if err != nil {
+				return status.Errorf(codes.InvalidArgument, "invalid public IP: %v", err)
+			}
+			m.state.PublicIP = ip
+		}
+	}
+
+	if len(req.Endpoints) > 0 {
+		endpoints := make([]netip.AddrPort, len(req.Endpoints))
+		for i, ep := range req.Endpoints {
+			ap, err := ep.ToAddrPort()
+			if err != nil {
+				return status.Errorf(codes.InvalidArgument, "invalid endpoint: %v", err)
+			}
+			endpoints[i] = ap
+		}
+		m.state.Network.Endpoints = endpoints
+	}
+
+	if err := m.state.Save(); err != nil {
+		return status.Errorf(codes.Internal, "save machine state: %v", err)
+	}
+	return nil
 }
 
 // getMachineRTTs retrieves round-trip times to other machines in the cluster.

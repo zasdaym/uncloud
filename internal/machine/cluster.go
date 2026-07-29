@@ -26,14 +26,21 @@ import (
 	"github.com/psviderski/unregistry"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/proto"
 )
+
+// machineSyncInterval is how often the machine info is republished to the cluster store to recover from
+// failed synchronous syncs.
+const machineSyncInterval = 60 * time.Second
 
 // clusterController is the main controller for the machine that is a cluster member. It manages components such as
 // the WireGuard network, API server listening the WireGuard network, Corrosion service, Docker network and containers,
 // and others.
 type clusterController struct {
-	state *State
-	store *store.Store
+	// machine is the parent machine.
+	machine *Machine
+	state   *State
+	store   *store.Store
 
 	wgnet           *network.WireGuardNetwork
 	endpointChanges <-chan network.EndpointChangeEvent
@@ -42,10 +49,14 @@ type clusterController struct {
 	corroService corroservice.Service
 	// corrosionDir is the disk path that holds the Corrosion config and data.
 	// TODO: remove in 0.22 assuming all pre 0.20 clusters upgraded their pre-v1 Corrosion.
-	corrosionDir string
-	dockerCtrl   *docker.Controller
+	corrosionDir  string
+	dockerService *docker.Service
+	dockerCtrl    *docker.Controller
 	// dockerReady is signalled when Docker is configured and ready for containers.
 	dockerReady chan<- struct{}
+
+	// syncMachineTrigger requests to sync the machine info to the cluster store.
+	syncMachineTrigger chan struct{}
 	// clusterReady is signalled when the cluster controller has finished initializing all components.
 	clusterReady    chan<- struct{}
 	caddyconfigCtrl *caddyconfig.Controller
@@ -63,7 +74,7 @@ type clusterController struct {
 }
 
 func newClusterController(
-	state *State,
+	machine *Machine,
 	store *store.Store,
 	server *grpc.Server,
 	corroService corroservice.Service,
@@ -85,22 +96,25 @@ func newClusterController(
 	endpointChanges := wgnet.WatchEndpoints()
 
 	return &clusterController{
-		state:           state,
-		store:           store,
-		wgnet:           wgnet,
-		endpointChanges: endpointChanges,
-		server:          server,
-		corroService:    corroService,
-		corrosionDir:    corrosionDir,
-		dockerCtrl:      docker.NewController(state.ID, dockerService, store),
-		dockerReady:     dockerReady,
-		clusterReady:    clusterReady,
-		caddyconfigCtrl: caddyfileCtrl,
-		dnsServer:       dnsServer,
-		dnsResolver:     dnsResolver,
-		unregistry:      unregistry,
-		metricsServer:   metricsServer,
-		stopped:         make(chan struct{}),
+		machine:            machine,
+		state:              machine.state,
+		store:              store,
+		wgnet:              wgnet,
+		endpointChanges:    endpointChanges,
+		server:             server,
+		corroService:       corroService,
+		corrosionDir:       corrosionDir,
+		dockerService:      dockerService,
+		dockerCtrl:         docker.NewController(machine.state.ID, dockerService, store),
+		dockerReady:        dockerReady,
+		syncMachineTrigger: make(chan struct{}, 1),
+		clusterReady:       clusterReady,
+		caddyconfigCtrl:    caddyfileCtrl,
+		dnsServer:          dnsServer,
+		dnsResolver:        dnsResolver,
+		unregistry:         unregistry,
+		metricsServer:      metricsServer,
+		stopped:            make(chan struct{}),
 	}, nil
 }
 
@@ -137,7 +151,7 @@ func (cc *clusterController) Run(ctx context.Context) error {
 		slog.Info("Corrosion service started.")
 	}
 
-	// Apply the seed to finish Corrosion migrations from 0.x to 2026.5.14 (upstream v1.0.0) if applicable.
+	// Apply the seed to finish Corrosion migrations from 0.x to 2026.x.x (upstream v1.0.0) if applicable.
 	if err := corromigrate.ApplySeedIfPresent(ctx, cc.corrosionDir, cc.store); err != nil {
 		return fmt.Errorf("apply corrosion migration seed: %w", err)
 	}
@@ -159,7 +173,9 @@ func (cc *clusterController) Run(ctx context.Context) error {
 		return nil
 	})
 
-	// Start the network API server. Assume the management IP can't be changed when the network is running.
+	// Start the network API server before waiting for the store sync so the machine is reachable on the mesh
+	// during the sync and can serve requests that don't depend on the store.
+	// Assume the management IP can't be changed when the network is running.
 	apiAddr := net.JoinHostPort(cc.state.Network.ManagementIP.String(), strconv.Itoa(constants.MachineAPIPort))
 	listener, err := net.Listen("tcp", apiAddr)
 	if err != nil {
@@ -183,12 +199,7 @@ func (cc *clusterController) Run(ctx context.Context) error {
 	// Check if waitStoreSync exited because the context was cancelled. Return early in that case.
 	if ctx.Err() != nil {
 		cc.stopAPIServer()
-
-		err := errGroup.Wait()
-		if corroErr := cc.stopCorrosion(); corroErr != nil {
-			err = errors.Join(err, corroErr)
-		}
-		return err
+		return errGroup.Wait()
 	}
 
 	errGroup.Go(func() error {
@@ -214,6 +225,11 @@ func (cc *clusterController) Run(ctx context.Context) error {
 			return fmt.Errorf("embedded DNS server failed: %w", err)
 		}
 		return nil
+	})
+
+	// Keep the machine info in the cluster store in sync with the actual machine state (the source of truth).
+	errGroup.Go(func() error {
+		return cc.runMachineSync(ctx)
 	})
 
 	// Synchronise Docker containers to the cluster store.
@@ -270,15 +286,9 @@ func (cc *clusterController) Run(ctx context.Context) error {
 		slog.Info("Unregistry server stopped.")
 	}
 
-	// Wait for all controllers to finish.
-	err = errGroup.Wait()
-
-	// Stop Corrosion after all controllers depending on it and API server are stopped.
-	if corroErr := cc.stopCorrosion(); corroErr != nil {
-		err = errors.Join(err, corroErr)
-	}
-
-	return err
+	// Wait for all controllers to finish. The Corrosion service shutdown is handled by the machine after stopping all
+	// local API servers that may still serve requests depending on the store.
+	return errGroup.Wait()
 }
 
 // stopAPIServer gracefully stops the network API server with a timeout.
@@ -302,19 +312,6 @@ func (cc *clusterController) stopAPIServer() {
 	}
 
 	slog.Info("Network API server stopped.")
-}
-
-// stopCorrosion stops the Corrosion service with a timeout.
-func (cc *clusterController) stopCorrosion() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	if err := cc.corroService.Stop(ctx); err != nil {
-		return fmt.Errorf("stop corrosion service: %w", err)
-	}
-	slog.Info("Corrosion service stopped.")
-
-	return nil
 }
 
 // ensureDockerNetwork ensures that the Docker network is configured and ready for containers.
@@ -485,10 +482,131 @@ func (cc *clusterController) waitKnownMissingChanges(ctx context.Context) error 
 	}
 }
 
+// runMachineSync keeps this machine's info in the cluster store in sync with the local state and the Docker engine
+// version. Call RequestMachineSync to trigger an immediate sync.
+func (cc *clusterController) runMachineSync(ctx context.Context) error {
+	// Backfill legacy local state from the cluster store once before the first sync.
+	if err := cc.backfillMachineState(ctx); err != nil {
+		return fmt.Errorf("backfill machine state: %w", err)
+	}
+
+	if err := cc.syncMachineInfo(ctx); err != nil {
+		slog.Error("Failed to sync machine info to cluster store.", "err", err)
+	}
+
+	ticker := time.NewTicker(machineSyncInterval)
+	defer ticker.Stop()
+	dockerRestarted := cc.dockerService.WatchDaemonRestart(ctx)
+
+	for {
+		select {
+		case <-ctx.Done():
+		case <-ticker.C: // Scheduled periodic sync.
+		case <-cc.syncMachineTrigger: // Immediate sync request.
+		case <-dockerRestarted: // Docker daemon restarted -- engine version may have changed.
+		}
+
+		// A pending restart signal can race with context cancellation and win the select.
+		if ctx.Err() != nil {
+			return nil
+		}
+
+		if err := cc.syncMachineInfo(ctx); err != nil {
+			slog.Error("Failed to sync machine info to cluster store.", "err", err)
+		}
+	}
+}
+
+// RequestMachineSync triggers an immediate sync of this machine's info to the cluster store.
+// It never blocks and coalesces with any already pending sync.
+func (cc *clusterController) RequestMachineSync() {
+	select {
+	case cc.syncMachineTrigger <- struct{}{}:
+	default:
+	}
+}
+
+// syncMachineInfo republishes this machine's info from local state to the cluster store, skipping the
+// write if the info is unchanged since the last successful write.
+func (cc *clusterController) syncMachineInfo(ctx context.Context) error {
+	publishedInfo, err := cc.store.GetMachine(ctx, cc.state.ID)
+	if err != nil && !errors.Is(err, store.ErrMachineNotFound) {
+		return fmt.Errorf("get machine from store: %w", err)
+	}
+
+	info := cc.machine.Info(ctx)
+	if publishedInfo != nil {
+		// Info leaves the Docker engine version empty when the engine is unavailable. Keep the previously
+		// published version in that case rather than overwriting it with an empty value.
+		if info.DockerVersion == "" {
+			info.DockerVersion = publishedInfo.DockerVersion
+		}
+
+		// Skip the write if nothing changed since the last successful sync.
+		if proto.Equal(info, publishedInfo) {
+			return nil
+		}
+	}
+
+	if err = cc.store.UpdateMachine(ctx, info); err != nil {
+		if !errors.Is(err, store.ErrMachineNotFound) {
+			return fmt.Errorf("update machine in store: %w", err)
+		}
+		// The machine row is missing (not created yet or lost). Recreate it.
+		if err = cc.store.CreateMachine(ctx, info); err != nil {
+			return fmt.Errorf("create machine in store: %w", err)
+		}
+	}
+
+	slog.Info("Synced machine info to cluster store.", "id", info.Id, "name", info.Name)
+	return nil
+}
+
+// backfillMachineState backfills legacy local state that predates local ownership of endpoints/public IP
+// (implemented in 0.20) from the cluster store.
+// TODO: remove after releasing 0.22.
+func (cc *clusterController) backfillMachineState(ctx context.Context) error {
+	cc.state.mu.Lock()
+	defer cc.state.mu.Unlock()
+
+	if len(cc.state.Network.Endpoints) > 0 && cc.state.PublicIP.IsValid() {
+		return nil
+	}
+
+	existing, err := cc.store.GetMachine(ctx, cc.state.ID)
+	if err != nil {
+		if errors.Is(err, store.ErrMachineNotFound) {
+			// No existing row to backfill from. syncMachineInfo will create it.
+			return nil
+		}
+		return fmt.Errorf("get machine from store: %w", err)
+	}
+
+	changed := false
+	if len(cc.state.Network.Endpoints) == 0 {
+		if endpoints := endpointsToAddrPorts(existing.Network.GetEndpoints()); len(endpoints) > 0 {
+			cc.state.Network.Endpoints = endpoints
+			changed = true
+		}
+	}
+	if !cc.state.PublicIP.IsValid() && existing.PublicIp != nil {
+		if ip, _ := existing.PublicIp.ToAddr(); ip.IsValid() {
+			cc.state.PublicIP = ip
+			changed = true
+		}
+	}
+	if changed {
+		if err = cc.state.Save(); err != nil {
+			return fmt.Errorf("save backfilled machine state: %w", err)
+		}
+	}
+	return nil
+}
+
 // syncDockerContainers watches local Docker containers and syncs them to the cluster store.
 // TODO: move this to the Docker controller.
 func (cc *clusterController) syncDockerContainers(ctx context.Context) error {
-	// Retry to watch and sync containers until the context is done.
+	// Supervise the watch-and-sync pipeline until the context is done.
 	boff := backoff.WithContext(backoff.NewExponentialBackOff(
 		backoff.WithInitialInterval(100*time.Millisecond),
 		backoff.WithMaxInterval(5*time.Second),
@@ -502,7 +620,7 @@ func (cc *clusterController) syncDockerContainers(ctx context.Context) error {
 		return nil
 	}
 	if err := backoff.Retry(watchAndSync, boff); err != nil {
-		if errors.Is(err, context.Canceled) {
+		if ctx.Err() != nil {
 			return nil
 		}
 		return fmt.Errorf("watch and sync containers to cluster store: %w", err)
@@ -512,74 +630,52 @@ func (cc *clusterController) syncDockerContainers(ctx context.Context) error {
 }
 
 // handleMachineChanges subscribes to machine changes in the cluster and reconfigures the network peers accordingly
-// when changes occur.
+// when changes occur. It returns an error when the subscription fails.
 func (cc *clusterController) handleMachineChanges(ctx context.Context) error {
-	for {
-		// Retry to subscribe to machine changes indefinitely until the context is done.
-		boff := backoff.WithContext(backoff.NewExponentialBackOff(
-			backoff.WithInitialInterval(1*time.Second),
-			backoff.WithMaxInterval(60*time.Second),
-			backoff.WithMaxElapsedTime(0),
-		), ctx)
+	machines, changes, err := cc.store.SubscribeMachines(ctx)
+	if err != nil {
+		return fmt.Errorf("subscribe to machine changes: %w", err)
+	}
+	slog.Info("Subscribed to machine changes in the cluster to reconfigure network peers.")
 
-		var (
-			machines []*pb.MachineInfo
-			changes  <-chan struct{}
-			err      error
-		)
-		subscribe := func() error {
-			if machines, changes, err = cc.store.SubscribeMachines(ctx); err != nil {
-				slog.Info("Failed to subscribe to machine changes, retrying.", "err", err)
-			}
-			return err
-		}
-		if err = backoff.Retry(subscribe, boff); err != nil {
-			if errors.Is(err, context.Canceled) {
-				return nil
-			}
-			slog.Error("Unexpected error while retrying to subscribe to machine changes.", "err", err)
-			continue
-		}
-		slog.Info("Subscribed to machine changes in the cluster to reconfigure network peers.")
-
-		// The machine store may be empty when a machine first joins the cluster, before store synchronization
-		// completes. Skip configuration now and apply it when the store changes are received.
-		// TODO: remove this check after ensuring the store is actually synced to the latest known state at this point.
-		//  See TODO in waitStoreSync.
-		if len(machines) > 0 {
-			slog.Info("Reconfiguring network peers with the current machines.", "machines", len(machines))
-			if err = cc.configurePeers(machines); err != nil {
-				slog.Error("Failed to configure peers.", "err", err)
-			}
-		}
-		// For simplicity, reconfigure all peers on any change.
-		for {
-			select {
-			// TODO: test when Corrosion fails and the subscription fails to resubscribe (after 1 minute). It seems
-			//  the changes channel will be closed and this will become a busy loop. Perhaps, the outer for loop should
-			//  be reworked as well.
-			case <-changes:
-				slog.Info("Cluster machines changed, reconfiguring network peers.")
-				if machines, err = cc.store.ListMachines(ctx); err != nil {
-					slog.Error("Failed to list machines.", "err", err)
-					continue
-				}
-				// Skip reconfiguration if the machines list is empty. This can happen when joining the cluster.
-				// Corrosion can notifies about table changes before the data is fully replicated.
-				// Reconfiguring with an empty list would remove all peers and lock this machine out of the cluster.
-				// See https://github.com/psviderski/uncloud/issues/155.
-				if len(machines) == 0 {
-					slog.Debug("Skipping peer reconfiguration: machines list in store is empty.")
-					continue
-				}
-				if err = cc.configurePeers(machines); err != nil {
-					slog.Error("Failed to configure peers.", "err", err)
-				}
-			case <-ctx.Done():
-				return nil
-			}
+	// Assume the initial store synchronization when this machine first joined the cluster has already been completed.
+	// So the machines should not be empty. But we still have a safety check to not reconfigure with an empty list,
+	// which would remove all peers and lock this machine out of the cluster.
+	// A list containing only this machine is a valid state (e.g. all other machines were removed) and should still
+	// trigger reconfiguration to drop any stale peers.
+	if len(machines) > 0 {
+		slog.Info("Reconfiguring network peers with the current machines.", "machines", len(machines))
+		if err = cc.configurePeers(machines); err != nil {
+			slog.Error("Failed to configure peers.", "err", err)
 		}
 	}
+
+	// For simplicity, reconfigure all peers on any change. The subscription closes the changes channel both on context
+	// cancellation and when the subscription fails, so this loop exits in both cases.
+	for range changes {
+		slog.Info("Cluster machines changed, reconfiguring network peers.")
+		if machines, err = cc.store.ListMachines(ctx); err != nil {
+			slog.Error("Failed to list machines.", "err", err)
+			continue
+		}
+		// A safety check for the exceptional case when something bad happened with the store. Reconfiguring with an
+		// empty list would remove all peers and lock this machine out of the cluster.
+		// See https://github.com/psviderski/uncloud/issues/155.
+		if len(machines) == 0 {
+			slog.Debug("Skipping peer reconfiguration: machines list in store is empty.")
+			continue
+		}
+		if err = cc.configurePeers(machines); err != nil {
+			slog.Error("Failed to configure peers.", "err", err)
+		}
+	}
+
+	// The changes channel was closed. It's a clean shutdown if the context was cancelled, otherwise the subscription
+	// failed and we return an error to fail the controller.
+	if ctx.Err() != nil {
+		return nil
+	}
+	return fmt.Errorf("subscription to machine changes in cluster store failed")
 }
 
 func (cc *clusterController) configurePeers(machines []*pb.MachineInfo) error {

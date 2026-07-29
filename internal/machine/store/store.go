@@ -265,6 +265,8 @@ func (s *Store) DeleteMachine(ctx context.Context, id string) error {
 
 // SubscribeMachines returns a list of machines and a channel that signals changes to the list. The channel doesn't
 // receive any values, it just signals when a machine has been added, updated, or deleted in the database.
+// The channel is closed when the machines are no longer subscribable: either the provided context is cancelled or
+// the underlying subscription fails.
 func (s *Store) SubscribeMachines(ctx context.Context) ([]*pb.MachineInfo, <-chan struct{}, error) {
 	sub, err := s.corro.SubscribeContext(ctx, "SELECT id, info FROM machines ORDER BY name", nil, false)
 	if err != nil {
@@ -290,7 +292,8 @@ func (s *Store) SubscribeMachines(ctx context.Context) ([]*pb.MachineInfo, <-cha
 		}
 
 		var m pb.MachineInfo
-		if err = protojson.Unmarshal([]byte(mJSON), &m); err != nil {
+		protojsonParser := protojson.UnmarshalOptions{DiscardUnknown: true}
+		if err = protojsonParser.Unmarshal([]byte(mJSON), &m); err != nil {
 			return nil, nil, fmt.Errorf("unmarshal machine info: %w", err)
 		}
 		machines = append(machines, &m)
